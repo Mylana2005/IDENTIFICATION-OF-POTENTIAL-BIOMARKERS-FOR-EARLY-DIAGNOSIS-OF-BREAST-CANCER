@@ -1,0 +1,745 @@
+---
+title: "ІДЕНТИФІКАЦІЯ ПОТЕНЦІЙНИХ БІОМАРКЕРІВ ДЛЯ РАННЬОЇ ДІАГНОСТИКИ РАКУ МОЛОЧНОЇ
+  ЗАЛОЗИ"
+author: "Руденко Милана"
+date: "2025-12-13"
+output: html_document
+---
+
+ Для проведення біоінформатичного аналізу було підготовлено програмне середовище R із використанням пакетів Bioconductor та CRAN, необхідних для обробки транскриптомних даних, функціонального аналізу та машинного навчання.
+
+```{r}
+# 3.1.1. ПІДГОТОВКА СЕРЕДОВИЩА
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+bioc_pkgs <- c(
+  "GEOquery", "limma", "hgu133plus2.db",
+  "clusterProfiler", "org.Hs.eg.db", "ReactomePA"
+)
+
+cran_pkgs <- c(
+  "ggplot2", "pheatmap", "dplyr", "tibble",
+  "caret", "randomForest", "pROC"
+)
+
+for(p in bioc_pkgs) if(!requireNamespace(p, quietly=TRUE)) BiocManager::install(p)
+for(p in cran_pkgs) if(!requireNamespace(p, quietly=TRUE)) install.packages(p)
+
+library(GEOquery)
+library(limma)
+library(hgu133plus2.db)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ReactomePA)
+
+library(ggplot2)
+library(pheatmap)
+library(dplyr)
+library(tibble)
+library(caret)
+library(randomForest)
+library(pROC)
+```
+
+ Транскриптомні дані молочної залози було отримано з бази GEO (набір GSE15852), що містить профілі експресії генів для нормальних та пухлинних зразків.
+ У результаті сформовано матрицю експресії генів та метадані з інформацією про групи зразків.
+
+```{r}
+# 3.1.2. ЗАВАНТАЖЕННЯ ТА ОЧИСТКА ДАНИХ
+
+gset <- getGEO("GSE15852", GSEMatrix = TRUE)[[1]]
+
+expr_matrix <- exprs(gset)
+metadata <- pData(gset)
+
+metadata$group <- ifelse(
+  grepl("Normal", metadata$title, ignore.case = TRUE),
+  "Normal", "Tumor"
+)
+metadata$group <- factor(metadata$group)
+
+table(metadata$group)
+```
+
+ Для забезпечення коректного аналізу було виконано узгодження порядку зразків між експресійною матрицею та метаданими, а також усунено технічні дублікати проб.
+
+```{r}
+# 3.1.3. УЗГОДЖЕННЯ ПОРЯДКУ
+
+common_samples <- intersect(colnames(expr_matrix), rownames(metadata))
+expr_matrix <- expr_matrix[, common_samples]
+metadata <- metadata[common_samples, ]
+
+stopifnot(all(colnames(expr_matrix) == rownames(metadata)))
+
+# Числовий формат
+expr_matrix <- as.matrix(expr_matrix)
+mode(expr_matrix) <- "numeric"
+
+# Видалення дублікатів probe
+expr_matrix <- expr_matrix[!duplicated(rownames(expr_matrix)), ]
+```
+
+ Для первинної оцінки якості даних побудовано boxplot розподілу експресії генів, що дозволяє перевірити однорідність та відсутність технічних зсувів між зразками.
+
+```{r}
+# 3.1.4. КОНТРОЛЬ ЯКОСТІ: BOXPLOT
+
+# Дані вже log2 normalized (GEO processed)
+boxplot(expr_matrix, outline = FALSE, las = 2,
+        main = "Expression distribution (raw processed)")
+```
+
+ Аналіз головних компонент (PCA) застосовано для візуалізації загальної структури даних та оцінки розділення між нормальними і пухлинними зразками.
+
+```{r}
+# 3.1.5. КОНТРОЛЬ ЯКОСТІ: PCA
+
+pca <- prcomp(t(expr_matrix))
+pca_df <- data.frame(
+  PC1 = pca$x[,1],
+  PC2 = pca$x[,2],
+  group = metadata$group
+)
+
+ggplot(pca_df, aes(PC1, PC2, color = group)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  ggtitle("PCA: Tumor vs Normal")
+```
+
+ Для ідентифікації диференційно експресованих генів між групами Tumor та Normal використано лінійні моделі пакета limma з корекцією на множинне тестування.
+
+```{r}
+# 3.2.1. DEGs - LIMMA
+
+design <- model.matrix(~ group, data = metadata)
+fit <- lmFit(expr_matrix, design)
+fit <- eBayes(fit)
+
+deg_all <- topTable(
+  fit,
+  coef = "groupTumor",
+  number = Inf,
+  adjust.method = "BH"
+) %>% rownames_to_column("ProbeID")
+
+deg_sig <- deg_all %>%
+  filter(adj.P.Val < 0.05 & abs(logFC) >= 1)
+
+nrow(deg_sig)
+```
+
+ Отримано перелік генів зі статистично значущими змінами рівня експресії.
+
+```{r}
+# 3.2.2. ТАБЛИЦЯ ЗНАЧУЩИХ DEGs 
+
+deg_sig %>%
+  select(ProbeID, logFC, adj.P.Val) %>%
+  arrange(adj.P.Val) %>%
+  head(15)
+```
+
+ Volcano plot використано для наочного представлення результатів диференційного аналізу з урахуванням величини змін експресії та статистичної значущості.
+
+```{r}
+# 3.2.3. VOLCANO PLOT
+
+ggplot(deg_all, aes(logFC, -log10(adj.P.Val))) +
+  geom_point(alpha = 0.4) +
+  geom_vline(xintercept = c(-1,1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  theme_minimal() +
+  ggtitle("Volcano plot")
+```
+
+ Для біологічної інтерпретації диференційно експресованих генів було виконано анотацію проб мікрочипа GPL570 з використанням офіційних генних символів та ідентифікаторів Entrez.
+
+```{r}
+# 3.3.1. АНОТАЦІЯ GPL570
+
+annot <- AnnotationDbi::select(
+  hgu133plus2.db,
+  keys = deg_sig$ProbeID,
+  columns = c("SYMBOL", "ENTREZID", "GENENAME"),
+  keytype = "PROBEID"
+)
+
+annot <- annot %>%
+  filter(!is.na(SYMBOL)) %>%
+  distinct(PROBEID, .keep_all = TRUE) %>%
+  rename(ProbeID = PROBEID)
+
+deg_annot <- left_join(deg_sig, annot, by = "ProbeID")
+
+head(deg_annot)
+```
+
+ Для виявлення біологічних процесів та сигнальних шляхів, асоційованих із виявленими DEGs, проведено аналіз функціонального збагачення за базами Gene Ontology та Reactome.
+
+```{r}
+# 3.3.2. ФУНКЦІОНАЛЬНИЙ АНАЛІЗ 
+
+entrez_genes <- unique(na.omit(deg_annot$ENTREZID))
+length(entrez_genes)
+
+ego <- enrichGO(
+  gene = entrez_genes,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  readable = TRUE
+)
+
+ereact <- enrichPathway(
+  gene = entrez_genes,
+  organism = "human"
+)
+```
+
+ Візуалізація результатів функціонального аналізу дозволяє визначити ключові біологічні процеси та молекулярні механізми, пов’язані з розвитком раку молочної залози.
+
+```{r}
+# 3.3.3. ФУНКЦІОНАЛЬНИЙ АНАЛІЗ: ВІЗУАЛІЗАЦІЯ
+
+enrichplot::dotplot(ego, showCategory = 15) +
+  ggtitle("GO Biological Process")
+
+enrichplot::dotplot(ereact, showCategory = 15) +
+  ggtitle("Reactome pathways")
+```
+
+ На основі величини змін експресії та статистичної значущості сформовано список потенційних біомаркерів, найбільш характерних для пухлинного фенотипу.
+
+```{r}
+# 3.4.1. ВІДБІР ПОТЕНЦІЙНИХ БІОМАРКЕРІВ
+
+candidates <- deg_annot %>%
+  filter(abs(logFC) >= 1, adj.P.Val < 0.05) %>%
+  arrange(adj.P.Val, desc(abs(logFC)))
+
+shortlist <- candidates %>% head(20)
+shortlist$SYMBOL
+```
+
+ Для візуальної оцінки експресійних патернів відібраних біомаркерів побудовано теплову карту, що демонструє чітке розділення між нормальними та пухлинними зразками.
+
+```{r}
+# 3.4.2. HEATMAP ТОП-БІОМАРКЕРІВ
+
+# Проби для short-list
+heat_probes <- shortlist$ProbeID
+
+# Матриця експресії
+heat_mat <- expr_matrix[heat_probes, , drop = FALSE]
+
+# Назви рядків = гени
+rownames(heat_mat) <- deg_annot$SYMBOL[
+  match(heat_probes, deg_annot$ProbeID)
+]
+
+# Анотація зразків
+ann_col <- data.frame(
+  Group = metadata$group
+)
+rownames(ann_col) <- colnames(heat_mat)
+
+# Побудова heatmap
+pheatmap(
+  heat_mat,
+  scale = "row",
+  annotation_col = ann_col,
+  show_colnames = FALSE,
+  fontsize_row = 8,
+  main = "Heatmap of top-20 differentially expressed genes"
+)
+```
+
+ Для підвищення стабільності моделей виконано додатковий фільтр диференційно експресованих генів за більш жорсткими статистичними критеріями.
+
+```{r}
+# 3.5.1. ПОПЕРЕДНІЙ СТАТИСТИЧНИЙ ВІДБІР (DEGs)  
+
+deg_filtered <- deg_annot %>%
+  filter(
+    adj.P.Val < 0.01,
+    abs(logFC) >= 1
+  ) %>%
+  distinct(SYMBOL, .keep_all = TRUE)
+
+nrow(deg_filtered)
+head(deg_filtered[, c("SYMBOL", "logFC", "adj.P.Val")])
+```
+
+ На основі скоригованих p-значень сформовано початкову панель із 50 найбільш інформативних генів для подальшого машинного навчання.
+
+```{r}
+# 3.5.2. ФОРМУВАННЯ ПОЧАТКОВОЇ ПАНЕЛІ (TOP-50)
+
+initial_panel <- deg_filtered %>%
+  arrange(adj.P.Val) %>%
+  head(50)
+
+initial_panel$SYMBOL
+```
+
+ Експресійні значення проб було агреговано на рівні генів, що дозволило сформувати зручну матрицю ознак для моделей машинного навчання.
+
+```{r}
+# 3.5.3. ФОРМУВАННЯ МАТРИЦІ ОЗНАК 
+
+probe_gene_map <- deg_annot %>%
+  filter(SYMBOL %in% initial_panel$SYMBOL) %>%
+  select(ProbeID, SYMBOL)
+
+expr_sub <- expr_matrix[probe_gene_map$ProbeID, , drop = FALSE]
+expr_df <- as.data.frame(expr_sub)
+expr_df$Gene <- probe_gene_map$SYMBOL
+
+expr_gene <- expr_df %>%
+  group_by(Gene) %>%
+  summarise(across(where(is.numeric), mean), .groups = "drop")
+
+X_panel <- t(as.matrix(expr_gene[, -1]))
+colnames(X_panel) <- expr_gene$Gene
+
+y <- factor(metadata$group, levels = c("Normal", "Tumor"))
+
+# Перевірка балансу класів
+table(y)
+prop.table(table(y))
+```
+
+ Алгоритм Random Forest використано для оцінки важливості кожного гена та зменшення розмірності ознакового простору.
+
+```{r}
+# 3.6.1. НАВЧАННЯ Random Forest ДЛЯ ОЦІНКИ ВАЖЛИВОСТІ ГЕНІВ
+
+set.seed(123)
+
+rf_fs <- randomForest(
+  x = X_panel,
+  y = y,
+  ntree = 500,
+  importance = TRUE
+)
+
+rf_importance <- importance(rf_fs) %>%
+  as.data.frame() %>%
+  rownames_to_column("Gene") %>%
+  arrange(desc(MeanDecreaseGini))
+
+head(rf_importance, 10)
+```
+
+ За результатами оцінки важливості сформовано фінальну панель із 30 генів, що мають найбільший внесок у класифікацію зразків.
+
+```{r}
+# 3.6.2. ФІНАЛЬНА ПАНЕЛЬ ГЕНІВ (TOP-30)
+
+final_genes <- rf_importance %>%
+  head(30) %>%
+  pull(Gene)
+
+final_genes
+```
+
+ На основі фінальної панелі генів побудовано остаточну матрицю ознак, яка використовується для навчання та тестування моделей.
+
+```{r}
+# 3.6.3. МАТРИЦЯ ОЗНАК ДЛЯ ML (30 генів)
+
+# Витягуємо відповідність probe → gene
+probe_gene_map <- deg_annot %>%
+  filter(SYMBOL %in% final_genes) %>%
+  select(ProbeID, SYMBOL)
+
+# Вибираємо експресію потрібних probe
+expr_sub <- expr_matrix[probe_gene_map$ProbeID, , drop = FALSE]
+
+# Додаємо назви генів
+expr_df <- as.data.frame(expr_sub)
+expr_df$Gene <- probe_gene_map$SYMBOL
+
+# Агрегація: один ген = одне значення (mean)
+expr_gene <- expr_df %>%
+  group_by(Gene) %>%
+  summarise(across(where(is.numeric), mean), .groups = "drop")
+
+# Формуємо фінальну матрицю (samples × genes)
+X_final <- t(as.matrix(expr_gene[, -1]))
+colnames(X_final) <- expr_gene$Gene
+
+dim(X_final)
+
+# Фінальна матриця ознак (фрагмент)
+knitr::kable(
+  head(X_final),
+  digits = 3,
+  caption = "Фрагмент фінальної матриці ознак (зразки × 30 генів)"
+)
+
+```
+
+ Дані було випадково поділено на навчальну та тестову вибірки для первинної оцінки узагальнювальної здатності моделей.
+
+```{r}
+# 3.7.1. TRAIN/TEST SPLIT
+
+set.seed(123)
+train_id <- createDataPartition(y, p = 0.7, list = FALSE)
+
+X_train <- X_final[train_id, , drop = FALSE]
+X_test  <- X_final[-train_id, , drop = FALSE]
+
+y_train <- y[train_id]
+y_test  <- y[-train_id]
+
+table(y_train)
+table(y_test)
+```
+
+ Для біологічної інтерпретації фінальної панелі генів виконано зіставлення з ідентифікаторами Entrez.
+
+```{r}
+# 3.7.2. ФУНКЦІОНАЛЬНИЙ АНАЛІЗ ФІНАЛЬНОЇ ПАНЕЛІ ГЕНІВ
+
+final_entrez <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = final_genes,
+  columns = "ENTREZID",
+  keytype = "SYMBOL"
+) %>%
+  filter(!is.na(ENTREZID)) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+length(final_entrez)
+final_entrez
+```
+
+ Аналіз GO Biological Process дозволяє виявити ключові клітинні процеси, асоційовані з відібраною панеллю біомаркерів.
+
+```{r}
+# 3.7.3. GO Biological Process (інтерпретація)
+
+ego_final <- enrichGO(
+  gene = final_entrez,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  readable = TRUE
+)
+
+enrichplot::dotplot(
+  ego_final,
+  showCategory = 15
+) +
+  ggtitle("GO Biological Processes enriched in final gene panel")
+```
+
+ Аналіз сигнальних шляхів Reactome дає змогу ідентифікувати молекулярні каскади, залучені до канцерогенезу молочної залози.
+
+```{r}
+# 3.7.4. REACTOME PATHWAYS (сигнальні шляхи)
+
+ereact_final <- enrichPathway(
+  gene = final_entrez,
+  organism = "human",
+  pAdjustMethod = "BH",
+  readable = TRUE
+)
+
+enrichplot::dotplot(
+  ereact_final,
+  showCategory = 15
+) +
+  ggtitle("Reactome pathways enriched in final gene panel")
+```
+
+ Модель Random Forest використано для класифікації зразків на основі фінальної панелі генів та оцінки її діагностичної ефективності.
+
+```{r}
+# 3.8.1. RANDOM FOREST
+
+rf <- randomForest(
+  x = X_train,
+  y = y_train,
+  ntree = 500,
+  importance = TRUE
+)
+
+prob_rf <- predict(rf, X_test, type = "prob")[,"Tumor"]
+roc_rf <- roc(y_test, prob_rf)
+
+plot(
+  roc_rf,
+  main = paste("Random Forest (30 genes), AUC =",
+               round(auc(roc_rf), 3))
+)
+
+confusionMatrix(
+  factor(ifelse(prob_rf > 0.5, "Tumor", "Normal"),
+         levels = c("Normal", "Tumor")),
+  y_test
+)
+```
+
+ Аналіз важливості ознак дозволяє визначити гени, які найбільше впливають на прийняття рішень моделлю.
+
+```{r}
+# 3.8.2. RANDOM FOREST
+
+importance(rf) %>%
+  as.data.frame() %>%
+  rownames_to_column("Gene") %>%
+  arrange(desc(MeanDecreaseGini)) %>%
+  head(10)
+```
+
+ Для коректного навчання нейромережі виконано масштабування ознак та перетворення класів у числовий формат.
+
+```{r}
+# 3.9.1. ПІДГОТОВКА ДАНИХ ДЛЯ НЕЙРОМЕРЕЖІ
+
+# Масштабування ознак
+X_scaled <- scale(X_final)
+
+# Класи у числовому форматі
+y_num <- ifelse(y == "Tumor", 1, 0)
+
+# Train / test
+X_train_nn <- X_scaled[train_id, , drop = FALSE]
+X_test_nn  <- X_scaled[-train_id, , drop = FALSE]
+
+y_train_nn <- y_num[train_id]
+y_test_nn  <- y_num[-train_id]
+```
+
+ Багатошарову нейромережу навчено для класифікації зразків з оцінкою її здатності розрізняти пухлинні та нормальні тканини.
+
+```{r}
+# 3.9.2. НЕЙРОМЕРЕЖЕВА МОДЕЛЬ (MLP)
+
+library(nnet)
+library(pROC)
+library(caret)
+
+set.seed(123)
+
+nn_model <- nnet(
+  x = X_train_nn,
+  y = y_train_nn,
+  size = 10,
+  decay = 0.01,
+  maxit = 500,
+  linout = FALSE
+)
+
+nn_prob <- predict(nn_model, X_test_nn, type = "raw")
+roc_nn <- roc(y_test_nn, nn_prob)
+
+plot(
+  roc_nn,
+  main = paste("Neural network (30 genes), AUC =",
+               round(auc(roc_nn), 3))
+)
+```
+
+Якість нейромережевої моделі оцінено за допомогою ROC-кривої, AUC та матриці неточностей.
+
+```{r}
+# 3.9.3. ОЦІНКА ЯКОСТІ НЕЙРОМЕРЕЖІ
+
+# Ймовірності
+nn_prob <- predict(nn_model, X_test_nn, type = "raw")
+
+# Класи
+nn_pred <- ifelse(nn_prob > 0.5, 1, 0)
+
+# Матриця неточностей
+table(
+  Predicted = nn_pred,
+  Actual = y_test_nn
+)
+```
+
+ Для отримання стабільної оцінки якості класифікації застосовано 5-кратну перехресну валідацію.
+
+```{r}
+# 3.9.4. ПЕРЕХРЕСНА ВАЛІДАЦІЯ НЕЙРОМЕРЕЖІ
+
+X_df <- as.data.frame(X_scaled)
+colnames(X_df) <- make.unique(colnames(X_df))
+
+library(caret)
+library(pROC)
+
+set.seed(123)
+
+y_factor <- factor(
+  ifelse(y == "Tumor", "Tumor", "Normal"),
+  levels = c("Normal", "Tumor")
+)
+
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+nn_cv <- caret::train(
+  x = X_df,
+  y = y_factor,
+  method = "nnet",
+  trControl = ctrl,
+  metric = "ROC",
+  tuneGrid = data.frame(size = 5, decay = 0.01),
+  linout = FALSE,
+  trace = FALSE,
+  maxit = 500
+)
+
+nn_cv
+nn_cv$results
+```
+
+ Незалежний транскриптомний набір із GEO використано для перевірки узагальнювальної здатності моделей на зовнішніх даних.
+
+```{r}
+# 3.10.1. ФУНКЦІЯ ПІДГОТОВКИ НЕЗАЛЕЖНОГО GEO-НАБОРУ
+
+prepare_validation_set <- function(gse_id, genes, train_center, train_scale) {
+  
+  gset <- getGEO(gse_id, GSEMatrix = TRUE)[[1]]
+  expr <- exprs(gset)
+  meta <- pData(gset)
+  
+  meta$group <- ifelse(
+    grepl("normal", meta$title, ignore.case = TRUE),
+    "Normal", "Tumor"
+  )
+  meta$group <- factor(meta$group, levels = c("Normal", "Tumor"))
+  
+  # Анотація
+  annot <- AnnotationDbi::select(
+    hgu133plus2.db,
+    keys = rownames(expr),
+    columns = "SYMBOL",
+    keytype = "PROBEID"
+  ) %>% filter(!is.na(SYMBOL))
+  
+  probe_gene_map <- annot %>%
+    filter(SYMBOL %in% genes)
+  
+  expr_sub <- expr[probe_gene_map$PROBEID, , drop = FALSE]
+  expr_df <- as.data.frame(expr_sub)
+  expr_df$Gene <- probe_gene_map$SYMBOL
+  
+  expr_gene <- expr_df %>%
+    group_by(Gene) %>%
+    summarise(across(where(is.numeric), mean), .groups = "drop")
+  
+  X_val <- t(as.matrix(expr_gene[, -1]))
+  colnames(X_val) <- expr_gene$Gene
+  
+  X_val_scaled <- scale(
+    X_val,
+    center = train_center,
+    scale  = train_scale
+  )
+  
+  list(
+    X = X_val,
+    X_scaled = X_val_scaled,
+    y = meta$group
+  )
+}
+```
+
+ Параметри масштабування, отримані на навчальному наборі, застосовано до незалежних даних для уникнення витоку інформації.
+
+```{r}
+# 3.10.2. ПАРАМЕТРИ МАСШТАБУВАННЯ З TRAIN-НАБОРУ
+
+train_center <- attr(X_scaled, "scaled:center")
+train_scale  <- attr(X_scaled, "scaled:scale")
+```
+
+ Ефективність моделей оцінено на незалежному наборі шляхом обчислення ROC-кривих та AUC.
+
+```{r}
+# 3.10.3. ВАЛІДАЦІЙНІ НАБОРИ (GPL570)
+
+val_GSE42568 <- prepare_validation_set(
+  "GSE42568",
+  final_genes,
+  train_center,
+  train_scale
+)
+
+dim(val_GSE42568$X)
+table(val_GSE42568$y)
+```
+
+```{r}
+# 3.10.4. ОЦІНКА МОДЕЛЕЙ НА НЕЗАЛЕЖНИХ ДАНИХ. ФУНКЦІЯ ОЦІНКИ AUC
+
+evaluate_models <- function(val_set) {
+  
+  prob_rf <- predict(rf, val_set$X, type = "prob")[,"Tumor"]
+  auc_rf <- auc(roc(val_set$y, prob_rf))
+  
+  prob_nn <- predict(nn_model, val_set$X_scaled, type = "raw")
+  auc_nn <- auc(
+    roc(ifelse(val_set$y == "Tumor", 1, 0), prob_nn)
+  )
+  
+  data.frame(
+    RF_AUC = auc_rf,
+    NN_AUC = auc_nn
+  )
+}
+```
+
+```{r}
+# 3.10.5. РЕЗУЛЬТАТИ ВАЛІДАЦІЇ
+
+auc_42568 <- evaluate_models(val_GSE42568)
+
+validation_results <- data.frame(
+  Dataset = "GSE42568",
+  RF_AUC  = auc_42568$RF_AUC,
+  NN_AUC  = auc_42568$NN_AUC
+)
+
+knitr::kable(
+  validation_results,
+  digits = 3,
+  caption = "AUC ROC моделей на незалежному транскриптомному наборі GSE42568"
+)
+```
+
+ ROC-крива на незалежному наборі підтверджує здатність нейромережевої моделі узагальнюватися на нові транскриптомні дані.
+
+```{r}
+# 3.10.6. ROC-КРИВІ
+
+roc_nn_42568 <- roc(
+  ifelse(val_GSE42568$y == "Tumor", 1, 0),
+  predict(nn_model, val_GSE42568$X_scaled, type = "raw")
+)
+
+plot(
+  roc_nn_42568,
+  main = paste(
+    "Neural network ROC (GSE42568), AUC =",
+    round(auc(roc_nn_42568), 3)
+  )
+)
+```
+
